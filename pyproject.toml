@@ -1,0 +1,29 @@
+[build-system]
+requires = [ "setuptools" ]
+build-backend = 'setuptools.build_meta'
+
+[project]
+name = "gee-dataset-forge"
+version = "0.1.0"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { "text" = "Apache License, Version 2.0" }
+authors = [{name = "Giovanni Montefoschi", email = "giovannimontefoschi@gmail.com"}]
+description = "A package to download in bulk image chips constituting a multi-modal and multi-temporal dataset from Google Earth Engine"
+
+dependencies = [
+    "earthengine-api",
+    "requests",
+    "retry",
+]
+
+classifiers = [
+    "Private :: Do Not Upload",
+    "Development Status :: 2 - Pre-Alpha"
+]
+
+[tool.setuptools.packages.find]
+include = [
+    "gee_forge",
+    "gee_forge.*",
+]
