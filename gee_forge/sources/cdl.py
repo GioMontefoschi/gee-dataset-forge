@@ -22,7 +22,12 @@ def remap_crops(img: ee.Image):
 
 
 class CDLSource(ImageSource):
-    """USDA CDL source producing the original binary label output."""
+    """USDA CDL source producing the original binary label output.
+
+    CDL is an annual product, so this source collapses the configured time
+    windows into the single calendar year they cover instead of producing one
+    output per window.
+    """
 
     def __init__(
         self,
@@ -35,6 +40,42 @@ class CDLSource(ImageSource):
             global_filter=global_filter,
             initialize_ee=initialize_ee,
         )
+
+    def resolve_year(self, time_windows: dict[str, tuple[str, str]]) -> int:
+        """Return the CDL calendar year covered by the configured windows.
+
+        CDL publishes one image per year, stamped ``{year}-01-01``. Earth
+        Engine date filters match on ``system:time_start``, so a window that
+        does not contain a January 1st matches no image at all. The year is
+        therefore read from the window dates and expanded to a full calendar
+        year, rather than used as a filter range directly.
+
+        The year is taken from the earliest window start. Child classes can
+        override this when windows span two years and the later year is wanted.
+
+        Args:
+            time_windows: Mapping of ``window_name`` to
+                ``(start_date, end_date)``. Never empty.
+
+        Returns:
+            Calendar year selected from the configured windows.
+        """
+        earliest_start = min(start_date for start_date, _ in time_windows.values())
+        return int(earliest_start[:4])
+
+    def filter_time_windows(
+        self,
+        collection: ee.ImageCollection,
+        time_windows: dict[str, tuple[str, str]],
+        region: ee.Geometry,
+    ):
+        """Yield one annual collection instead of one output per window."""
+        if not time_windows:
+            yield None, collection
+            return
+
+        year = self.resolve_year(time_windows)
+        yield None, collection.filterDate(f"{year}-01-01", f"{year + 1}-01-01")
 
     def preprocess(
         self,

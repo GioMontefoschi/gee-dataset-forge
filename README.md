@@ -285,6 +285,21 @@ window name, such as `B2_spring` or `VV_summer`.
 Sources can override this behavior. `DEMSource`, for example, ignores time
 windows because elevation is static.
 
+Annual sources collapse the configured windows instead. `CDLSource` produces a
+single `label` band per chip, selecting the calendar year that the windows fall
+in. This is necessary because Earth Engine date filters match on
+`system:time_start`, and every CDL image is stamped `{year}-01-01`: a window
+such as `("2022-04-01", "2022-06-01")` contains no January 1st and so would
+match no image at all. The year is taken from the earliest window start, which
+for windows spanning two years means the earlier year is used. Override
+`CDLSource.resolve_year()` to select the later year instead:
+
+```python
+class WinterCDLSource(CDLSource):
+    def resolve_year(self, time_windows: dict[str, tuple[str, str]]) -> int:
+        return super().resolve_year(time_windows) + 1
+```
+
 ## Creating a New Image Source
 
 Add a new source by subclassing `ImageSource`. Most sources only need to set the
