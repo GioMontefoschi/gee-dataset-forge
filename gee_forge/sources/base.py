@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import shutil
 from pathlib import Path
 from typing import Any, Iterable
@@ -7,6 +8,195 @@ from typing import Any, Iterable
 import ee
 import requests as http_requests
 from retry import retry
+
+
+#: Points projected per Earth Engine round trip in ``project_points``.
+PROJECTION_CHUNK_SIZE = 500
+
+#: Cache of projected point coordinates, keyed by output CRS and input points.
+_PROJECTED_POINT_CACHE: dict[tuple[Any, ...], dict[tuple[float, float], list[float]]] = {}
+
+
+def parse_dimensions(dimensions: str | int | Iterable[int]) -> tuple[int, int]:
+    """Parse an Earth Engine ``dimensions`` value into ``(width, height)``.
+
+    Args:
+        dimensions: ``"{width}x{height}"``, a single integer, or an iterable of
+            one or two integers.
+
+    Returns:
+        Chip width and height in pixels.
+    """
+    if isinstance(dimensions, bool):
+        raise ValueError(f"Unsupported dimensions: {dimensions!r}")
+
+    if isinstance(dimensions, int):
+        values = [dimensions]
+    elif isinstance(dimensions, str):
+        text = dimensions.strip().lower()
+        try:
+            values = [int(part) for part in text.split("x")]
+        except ValueError as error:
+            raise ValueError(f"Unsupported dimensions: {dimensions!r}") from error
+    else:
+        try:
+            values = [int(value) for value in dimensions]
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Unsupported dimensions: {dimensions!r}") from error
+
+    if len(values) == 1:
+        values = values * 2
+    if len(values) != 2 or any(value <= 0 for value in values):
+        raise ValueError(f"Unsupported dimensions: {dimensions!r}")
+    return values[0], values[1]
+
+
+def decompose_transform(crs_transform: Iterable[float]) -> tuple[float, float, float, float]:
+    """Split a row-major Earth Engine ``crsTransform`` into scale and origin.
+
+    Args:
+        crs_transform: Affine transform as
+            ``[xScale, xShearing, xTranslation, yShearing, yScale, yTranslation]``,
+            matching ``ee.Projection.transform`` and ``ee.Image.reproject``.
+
+    Returns:
+        ``(x_scale, y_scale, x_origin, y_origin)``. ``y_scale`` is normally
+        negative, placing the origin at the top-left corner of the grid.
+
+    Raises:
+        ValueError: If the transform is not six numbers, has a zero scale, or
+            is rotated or sheared. Snapping a chip to a rotated grid is
+            ambiguous, so those transforms are rejected rather than silently
+            mishandled.
+    """
+    values = [float(value) for value in crs_transform]
+    if len(values) != 6:
+        raise ValueError(
+            f"crs_transform must contain 6 numbers, got {len(values)}: {values}"
+        )
+
+    x_scale, x_shear, x_origin, y_shear, y_scale, y_origin = values
+    if x_shear or y_shear:
+        raise ValueError(
+            "Rotated or sheared crs_transform is not supported for pixel-aligned "
+            f"chips: {values}"
+        )
+    if not x_scale or not y_scale:
+        raise ValueError(f"crs_transform must have non-zero scales: {values}")
+    return x_scale, y_scale, x_origin, y_origin
+
+
+def pixel_aligned_transform(
+    x: float,
+    y: float,
+    crs_transform: Iterable[float],
+    width: int,
+    height: int,
+) -> list[float]:
+    """Build a chip ``crsTransform`` centred on a point and snapped to the grid.
+
+    The chip keeps the scale and the pixel lattice of ``crs_transform``, so chips
+    from different points, dates, and sources share one grid and co-register
+    exactly. The point lands inside the pixel at ``(width // 2, height // 2)``,
+    which places it within half a pixel of the chip centre.
+
+    Args:
+        x: Point easting, in the units of the output CRS.
+        y: Point northing, in the units of the output CRS.
+        crs_transform: Reference grid transform that defines scale and lattice.
+        width: Chip width in pixels.
+        height: Chip height in pixels.
+
+    Returns:
+        Row-major affine transform for the chip's top-left corner.
+    """
+    x_scale, y_scale, x_origin, y_origin = decompose_transform(crs_transform)
+    column = math.floor((x - x_origin) / x_scale)
+    row = math.floor((y - y_origin) / y_scale)
+    chip_x = x_origin + (column - width // 2) * x_scale
+    chip_y = y_origin + (row - height // 2) * y_scale
+    return [x_scale, 0.0, chip_x, 0.0, y_scale, chip_y]
+
+
+def chip_region(
+    crs: str,
+    chip_transform: Iterable[float],
+    width: int,
+    height: int,
+    margin: float = 0.0,
+) -> ee.Geometry:
+    """Build the chip footprint as a rectangle in the output CRS.
+
+    Args:
+        crs: Output coordinate reference system.
+        chip_transform: Chip transform from ``pixel_aligned_transform``.
+        width: Chip width in pixels.
+        height: Chip height in pixels.
+        margin: Extra margin, in CRS units, added on every side.
+
+    Returns:
+        Planar rectangle covering the chip, expanded by ``margin``.
+    """
+    x_scale, y_scale, x_origin, y_origin = decompose_transform(chip_transform)
+    x_min, x_max = sorted((x_origin, x_origin + width * x_scale))
+    y_min, y_max = sorted((y_origin, y_origin + height * y_scale))
+    return ee.Geometry.Rectangle(
+        coords=[x_min - margin, y_min - margin, x_max + margin, y_max + margin],
+        proj=crs,
+        geodesic=False,
+    )
+
+
+def project_points(
+    coordinates: Iterable[Iterable[float]],
+    crs: str,
+    max_error: float = 0.001,
+) -> list[list[float]]:
+    """Project longitude/latitude pairs into ``crs`` using Earth Engine.
+
+    Points are deduplicated and sent in chunks, so the cost is a small number of
+    round trips regardless of how many points are requested. Results are cached,
+    so several sources sharing one point set and CRS only pay for the first call.
+
+    Requires an initialized Earth Engine session on the calling process.
+
+    Args:
+        coordinates: Iterable of ``(longitude, latitude)`` pairs in EPSG:4326.
+        crs: Target coordinate reference system.
+        max_error: Error margin, in meters, passed to ``ee.Geometry.transform``.
+
+    Returns:
+        Projected ``[x, y]`` pairs, in the order of ``coordinates``.
+    """
+    points = [(float(longitude), float(latitude)) for longitude, latitude in coordinates]
+    if not points:
+        return []
+
+    cache_key = (crs, max_error, tuple(points))
+    cached = _PROJECTED_POINT_CACHE.get(cache_key)
+    if cached is None:
+        unique = list(dict.fromkeys(points))
+        cached = {}
+        for start in range(0, len(unique), PROJECTION_CHUNK_SIZE):
+            chunk = unique[start : start + PROJECTION_CHUNK_SIZE]
+            projected = (
+                ee.Geometry.MultiPoint([list(point) for point in chunk])
+                .transform(crs, max_error)
+                .coordinates()
+                .getInfo()
+            )
+            if len(projected) != len(chunk):
+                raise ValueError(
+                    f"Earth Engine returned {len(projected)} projected points for "
+                    f"{len(chunk)} inputs while projecting into {crs}"
+                )
+            cached.update(
+                (point, [float(x), float(y)])
+                for point, (x, y) in zip(chunk, projected)
+            )
+        _PROJECTED_POINT_CACHE[cache_key] = cached
+
+    return [list(cached[point]) for point in points]
 
 
 class ImageSource:
@@ -42,39 +232,64 @@ class ImageSource:
     def get_requests(
         self,
         id_point_geometries: Iterable[Any],
-        buffer: int | float,
         crs: str,
         crs_transform: list[float],
         dimensions: str,
         time_bins: str | Iterable[str],
         time_windows: dict[str, tuple[str, str]] | None,
         out_dir: str | Path,
+        filter_margin: int | float = 0.0,
     ) -> list[tuple]:
         """Generate download request tuples for this source.
+
+        Each point gets its own ``crsTransform``, centred on the point and
+        snapped to the lattice of ``crs_transform``. The chip extent is therefore
+        defined entirely by ``crs_transform`` and ``dimensions``, and every chip
+        lands on the same pixel grid.
+
+        Requires an initialized Earth Engine session on the calling process,
+        because points are projected into ``crs`` to compute their transforms.
 
         Args:
             id_point_geometries: Iterable containing point ids and GeoJSON-like
                 point geometries. Supported items are ``(id, geometry)`` tuples,
                 dicts with ``id`` plus ``geometry``/``point``/``.geo``, or raw
                 point geometries, which are enumerated.
-            buffer: Point buffer, in meters, used to build chip bounds.
             crs: Output coordinate reference system.
-            crs_transform: Output affine transform passed to Earth Engine as
-                ``crsTransform``.
+            crs_transform: Reference grid transform, as
+                ``[xScale, 0, xTranslation, 0, yScale, yTranslation]``. Only its
+                scale and lattice are used; each chip gets its own origin.
             dimensions: Output chip dimensions as ``"{width}x{height}"``.
             time_bins: Output bin or bins used to organize downloaded files.
             time_windows: Mapping of ``window_name`` to ``(start_date, end_date)``.
             out_dir: Root directory where chips will be written.
+            filter_margin: Extra margin, in CRS units, added to the chip
+                footprint when filtering the source collection. Does not affect
+                the output grid.
 
         Returns:
             Request tuples that can be consumed by ``get_result``.
         """
         time_bins = [time_bins] if isinstance(time_bins, str) else list(time_bins)
         time_windows = self._normalize_time_windows(time_windows)
-        requests = []
+        width, height = parse_dimensions(dimensions)
 
-        for point_id, point in self._iter_id_point_geometries(id_point_geometries):
+        id_points = list(self._iter_id_point_geometries(id_point_geometries))
+        projected = project_points(
+            (self._point_coordinates(point) for _, point in id_points),
+            crs=crs,
+        )
+
+        requests = []
+        for (point_id, point), (x, y) in zip(id_points, projected):
             point_id = self._format_point_id(point_id)
+            chip_transform = pixel_aligned_transform(
+                x=x,
+                y=y,
+                crs_transform=crs_transform,
+                width=width,
+                height=height,
+            )
             for time_bin in time_bins:
                 time_bin = str(time_bin)
                 request_id = f"{point_id}{time_bin}{self.name}"
@@ -84,13 +299,13 @@ class ImageSource:
                         point_id,
                         time_bin,
                         point,
-                        buffer,
                         self.ee_collection_id,
                         crs,
-                        crs_transform,
+                        chip_transform,
                         dimensions,
                         Path(out_dir),
                         time_windows,
+                        filter_margin,
                     )
                 )
 
@@ -103,17 +318,22 @@ class ImageSource:
         point_id: str,
         time_bin: str,
         point: dict[str, Any],
-        buffer: int | float,
         ee_collection: str | ee.ImageCollection,
         crs: str,
-        crs_transform: list[float],
+        chip_transform: list[float],
         dimensions: str,
         out_dir: str | Path,
         time_windows: dict[str, tuple[str, str]] | None,
+        filter_margin: int | float = 0.0,
         ee_project: str | None = None,
         ee_opt_url: str | None = None,
     ) -> None:
-        """Download one image patch from Earth Engine."""
+        """Download one image patch from Earth Engine.
+
+        ``chip_transform`` is used both to reproject the image and to request the
+        download, so the export is a plain window read on the grid the image is
+        already pinned to, with no second reprojection.
+        """
         if self.initialize_ee:
             self._initialize_earth_engine(
                 ee_project=ee_project,
@@ -121,12 +341,18 @@ class ImageSource:
             )
 
         source_name = self.name.lower()
+        width, height = parse_dimensions(dimensions)
 
         collection = self._collection_from_request(ee_collection)
         collection = self.apply_global_filter(collection)
 
-        point_geometry = self._point_geometry(point)
-        region = point_geometry.buffer(buffer).bounds()
+        region = chip_region(
+            crs=crs,
+            chip_transform=chip_transform,
+            width=width,
+            height=height,
+            margin=filter_margin,
+        )
         collection = collection.filterBounds(region)
 
         time_windows = self._normalize_time_windows(time_windows)
@@ -142,7 +368,7 @@ class ImageSource:
                 time_bin=time_bin,
                 region=region,
                 crs=crs,
-                crs_transform=crs_transform,
+                crs_transform=chip_transform,
             )
             for window_name, window_collection in window_collections
         ]
@@ -152,7 +378,8 @@ class ImageSource:
         image = ee.Image.cat(images) if len(images) > 1 else images[0]
         self._download_image(
             image=image,
-            region=region,
+            crs=crs,
+            chip_transform=chip_transform,
             dimensions=dimensions,
             out_dir=Path(out_dir),
             time_bin=time_bin,
@@ -309,10 +536,33 @@ class ImageSource:
             return ee.Geometry.Point(point["coordinates"])
         raise ValueError(f"Unsupported point geometry: {point}")
 
+    def _point_coordinates(self, point: Any) -> tuple[float, float]:
+        """Return a point's ``(longitude, latitude)`` on the client.
+
+        ``ee.Geometry`` points are resolved with ``getInfo``, one call each, so
+        plain GeoJSON points are preferred for large point sets.
+        """
+        if point is None:
+            raise ValueError("Point geometry cannot be None")
+
+        if isinstance(point, ee.Geometry):
+            coordinates = point.getInfo().get("coordinates")
+        elif isinstance(point, dict):
+            if point.get("type") == "Feature" and point.get("geometry") is not None:
+                return self._point_coordinates(point["geometry"])
+            coordinates = point.get("coordinates")
+        else:
+            raise ValueError(f"Unsupported point geometry: {point}")
+
+        if not isinstance(coordinates, (list, tuple)) or len(coordinates) < 2:
+            raise ValueError(f"Unsupported point geometry: {point}")
+        return float(coordinates[0]), float(coordinates[1])
+
     def _download_image(
         self,
         image: ee.Image,
-        region: ee.Geometry,
+        crs: str,
+        chip_transform: list[float],
         dimensions: str,
         out_dir: Path,
         time_bin: str,
@@ -327,9 +577,13 @@ class ImageSource:
         if filename.exists():
             return
 
+        # The output grid is requested explicitly. Passing a region instead would
+        # let Earth Engine derive its own transform from the region bounds, which
+        # resamples the image onto an unaligned grid and leaves seam artifacts.
         url = image.getDownloadURL(
             {
-                "region": region,
+                "crs": crs,
+                "crs_transform": list(chip_transform),
                 "dimensions": dimensions,
                 "format": "GEO_TIFF",
             }

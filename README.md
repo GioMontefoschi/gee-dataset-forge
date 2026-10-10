@@ -236,7 +236,6 @@ downloader = ImageSourceDownloader(
 
 downloader.bulk_download(
     out_dir=OUT_DIR,
-    buffer=1_120,
     crs=projection["crs"],
     crs_transform=projection["transform"],
     dimensions="224x224",
@@ -251,9 +250,29 @@ downloader.bulk_download(
 )
 ```
 
-In `ImageSourceDownloader`, `buffer` is the Earth Engine point-buffer distance
-used to build the chip bounds. A `1_120` meter buffer around a point produces a
-roughly `2_240` meter square bounding region before export.
+### Chip Geometry
+
+Chip extent comes from `crs_transform` and `dimensions`: a `224x224` chip on a
+`10` meter transform covers `2_240` meters. There is no separate buffer.
+
+Each point gets its own `crsTransform`, centred on the point and snapped to the
+lattice of `crs_transform`, and that same transform is used both to reproject the
+image and to request the download. Chips therefore land on the reference grid
+exactly, and co-register across points, dates, and sources. Snapping moves the
+chip centre by up to half a pixel, which is the cost of keeping pixels aligned.
+
+Do not pass `region` plus `dimensions` to `getDownloadURL` instead. Earth Engine
+then derives its own transform from the region bounds, and because a lat/lon
+bounding box is rotated relative to a projected grid, the derived pixel size
+drifts off the nominal scale. Resampling onto that unaligned grid drops a row or
+column every `scale / drift` pixels and leaves a visible blocky seam pattern in
+every band.
+
+`crs` is used for all points, so a point set spanning several UTM zones needs to
+be split by zone and downloaded once per zone.
+
+`filter_margin` is optional and defaults to `0`. It widens only the region used
+to filter source collections, never the output grid.
 
 `points` may be provided as:
 

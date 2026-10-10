@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
+import ee
+
 from gee_forge.sources.base import ImageSource
 
 EARTH_ENGINE_HIGH_VOLUME_URL = "https://earthengine-highvolume.googleapis.com"
@@ -64,28 +66,34 @@ class ImageSourceDownloader:
 
     def generate_requests(
         self,
-        buffer: int | float,
         crs: str,
         crs_transform: list[float],
         dimensions: str,
         time_bins: str | Iterable[str],
         time_windows: dict[str, tuple[str, str]] | None,
         out_dir: str | Path,
+        filter_margin: int | float = 0.0,
     ) -> list[tuple[ImageSource, tuple, str | None, str | None]]:
-        """Generate download jobs for all configured image sources."""
+        """Generate download jobs for all configured image sources.
+
+        Chip extent comes from ``crs_transform`` and ``dimensions``; each point
+        gets its own grid-aligned transform. ``filter_margin`` only widens the
+        region used to filter source collections.
+        """
+        self._initialize_earth_engine()
         points = self._resolve_points()
         jobs = []
 
         for source in self.image_sources:
             source_requests = source.get_requests(
                 id_point_geometries=points,
-                buffer=buffer,
                 crs=crs,
                 crs_transform=crs_transform,
                 dimensions=dimensions,
                 time_bins=time_bins,
                 time_windows=time_windows,
                 out_dir=out_dir,
+                filter_margin=filter_margin,
             )
             jobs.extend(
                 (source, request, self.ee_project, self.ee_opt_url)
@@ -98,7 +106,6 @@ class ImageSourceDownloader:
     def bulk_download(
         self,
         out_dir: str | Path,
-        buffer: int | float,
         crs: str,
         crs_transform: list[float],
         dimensions: str,
@@ -106,10 +113,11 @@ class ImageSourceDownloader:
         time_windows: dict[str, tuple[str, str]] | None,
         num_workers: int = 20,
         show_progress: bool = True,
+        filter_margin: int | float = 0.0,
     ) -> list[tuple[ImageSource, tuple, str | None, str | None]]:
         """Generate and download all source requests."""
         jobs = self.generate_requests(
-            buffer=buffer,
+            filter_margin=filter_margin,
             crs=crs,
             crs_transform=crs_transform,
             dimensions=dimensions,
@@ -152,6 +160,19 @@ class ImageSourceDownloader:
         finally:
             if progress is not None:
                 progress.close()
+
+    def _initialize_earth_engine(self) -> None:
+        """Initialize Earth Engine on the calling process.
+
+        Request generation now projects points into the output CRS, so the
+        client needs a session of its own and not just the worker processes.
+        """
+        kwargs = {}
+        if self.ee_project is not None:
+            kwargs["project"] = self.ee_project
+        if self.ee_opt_url is not None:
+            kwargs["opt_url"] = self.ee_opt_url
+        ee.Initialize(**kwargs)
 
     def _resolve_points(self):
         if hasattr(self.points, "aggregate_array"):
