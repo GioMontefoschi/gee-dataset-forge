@@ -109,6 +109,43 @@ For example:
 dataset_chips/2022/s2l2a/000_2022_s2l2a.tif
 ```
 
+Sources that describe their chips also write a JSON sidecar next to the
+GeoTIFF, under the same name. Earth Engine drops image properties when it
+writes a GeoTIFF, so chip metadata cannot travel inside the file itself.
+`S2L2ASource` records, for each time window, how many pixels the composite
+left without valid data:
+
+```json
+{
+  "chip": {
+    "point_id": "000",
+    "time_bin": "2022",
+    "source": "s2l2a",
+    "crs": "EPSG:32633",
+    "crs_transform": [10.0, 0.0, 368590.0, 0.0, -10.0, 4568450.0],
+    "dimensions": [224, 224]
+  },
+  "t0": {
+    "nodata_pixels": 0,
+    "nodata_fraction": 0.0,
+    "counted_pixels": 50176,
+    "scene_count": 4
+  },
+  "t1": {
+    "nodata_pixels": 50176,
+    "nodata_fraction": 1.0,
+    "counted_pixels": 50176,
+    "scene_count": 0
+  }
+}
+```
+
+Counts are measured on the chip's own grid, over the chip footprint alone, so
+they never include pixels outside the patch or inside a `filter_margin`.
+`counted_pixels` is the number of pixels the count visited, and differs from
+the chip's pixel count only if Earth Engine reduced on an unexpected grid.
+A window with no scenes at all is reported as missing in every pixel.
+
 ## Example: Sample Points From CDL
 
 ```python
@@ -373,6 +410,38 @@ class NDVISource(ImageSource):
 Override `filter_time_window()` when a collection cannot use a plain
 `filterDate(start_date, end_date)` call. Override `filter_time_windows()` only
 when a source should not produce one output per configured window.
+
+Override `chip_metadata()` to describe each chip in a JSON sidecar. It is
+called once per time window with that window's output image and collection,
+and returns a mapping of sidecar keys to values. Values may be unresolved
+Earth Engine objects: a chip's whole mapping is resolved in one round trip,
+whatever the number of windows. Sources that keep the default return nothing
+and write no sidecar.
+
+```python
+    def chip_metadata(
+        self,
+        image: ee.Image,
+        collection: ee.ImageCollection,
+        window_name: str | None,
+        time_bin: str,
+        region: ee.Geometry,
+        crs: str,
+        crs_transform: list[float],
+        width: int,
+        height: int,
+    ) -> dict[str, Any]:
+        counts = count_nodata(
+            image=image, region=region, crs=crs, crs_transform=crs_transform
+        )
+        return {window_name: ee.Dictionary({"nodata_pixels": counts.get("nodata")})}
+```
+
+Keys are merged across windows into one document, so key them by window.
+`chip` is reserved for the identifying block the downloader writes.
+`count_nodata()`, from `gee_forge.sources.base`, counts the masked pixels of
+any image already reprojected onto the chip grid, and is not specific to
+Sentinel-2.
 
 ## License
 

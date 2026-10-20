@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from typing import Any
+
 import ee
 
-from gee_forge.sources.base import ImageSource
+from gee_forge.sources.base import ImageSource, count_nodata
 
 S2L2A_BANDS = [
         "B1",
@@ -42,6 +44,28 @@ def prepare_s2(image: ee.Image) -> ee.Image:
     return mask_s2_clouds(image).select(S2L2A_BANDS).resample("bilinear")
 
 
+def blank_s2(collection_id: str) -> ee.Image:
+    """Build a fully masked scene that keeps empty windows well formed.
+
+    A window can end up with no scenes at all, and the median of an empty
+    collection is an image with no bands: renaming it fails, and so does
+    exporting it next to the windows that do have data. Merging this image
+    into every window keeps the band names and the band types of a real
+    scene. Every pixel of it is masked, so it never reaches the median of a
+    window that has scenes of its own, and a window that has none composites
+    to a chip that is masked everywhere.
+
+    Args:
+        collection_id: Collection the window scenes come from, used so the
+            blank scene carries exactly their band types.
+
+    Returns:
+        Prepared scene with every pixel masked.
+    """
+    scene = ee.Image(ee.ImageCollection(collection_id).first())
+    return prepare_s2(scene).updateMask(ee.Image.constant(0))
+
+
 class S2L2ASource(ImageSource):
     """Sentinel-2 L2A source using the original median-composite pipeline."""
 
@@ -75,12 +99,53 @@ class S2L2ASource(ImageSource):
         crs: str,
         crs_transform: list[float],
     ) -> ee.Image:
-        image = (
-            collection.map(prepare_s2)
-            .median()
-            .reproject(crs=crs, crsTransform=crs_transform)
+        prepared = collection.map(prepare_s2).merge(
+            ee.ImageCollection([blank_s2(self.ee_collection_id)])
         )
+        image = prepared.median().reproject(crs=crs, crsTransform=crs_transform)
 
         if window_name is None:
             return image
         return image.rename([f"{band}_{window_name}" for band in S2L2A_BANDS])
+
+    def chip_metadata(
+        self,
+        image: ee.Image,
+        collection: ee.ImageCollection,
+        window_name: str | None,
+        time_bin: str,
+        region: ee.Geometry,
+        crs: str,
+        crs_transform: list[float],
+        width: int,
+        height: int,
+    ) -> dict[str, Any]:
+        """Record how much of the window composite holds no valid data.
+
+        Every reflectance band carries the one SCL-derived mask, so counting a
+        single band describes the whole chip. A window with no scenes
+        composites to a masked chip, and is therefore reported as missing in
+        all of its pixels without needing a case of its own.
+        """
+        counts = count_nodata(
+            image=image,
+            region=region,
+            crs=crs,
+            crs_transform=crs_transform,
+        )
+        nodata = ee.Number(counts.get("nodata")).round().toInt()
+        counted = ee.Number(counts.get("counted")).round().toInt()
+
+        window_key = window_name if window_name is not None else self.name.lower()
+        return {
+            window_key: ee.Dictionary(
+                {
+                    "nodata_pixels": nodata,
+                    "nodata_fraction": nodata.divide(width * height),
+                    # Equal to the chip's pixel count unless Earth Engine
+                    # reduced on a grid other than the chip's own.
+                    "counted_pixels": counted,
+                    "scene_count": collection.size(),
+                }
+            )
+        }

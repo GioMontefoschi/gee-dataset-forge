@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import shutil
 from pathlib import Path
@@ -144,6 +145,56 @@ def chip_region(
         coords=[x_min - margin, y_min - margin, x_max + margin, y_max + margin],
         proj=crs,
         geodesic=False,
+    )
+
+
+def count_nodata(
+    image: ee.Image,
+    region: ee.Geometry,
+    crs: str,
+    crs_transform: Iterable[float],
+    band: int | str = 0,
+    max_pixels: int | float = 1e8,
+) -> ee.Dictionary:
+    """Count the pixels of a chip that hold no valid data.
+
+    The reduction reads the very pixels the download writes: it runs on the
+    chip grid, so ``crs`` and ``crs_transform`` must be the ones passed to
+    ``getDownloadURL``, and ``region`` must be the chip footprint built from
+    that transform, without any filter margin. On that grid the footprint
+    corners fall on pixel boundaries, so the chip's own pixels are the only
+    ones whose centres lie inside it. The reducer is unweighted on top of
+    that, so a pixel counts whole or not at all instead of being weighted by
+    how much of it the region covers.
+
+    ``ee.Image.mask`` returns an image that is itself unmasked, so inverting
+    it marks exactly the pixels Earth Engine would export as NoData.
+
+    Args:
+        image: Image already reprojected onto the chip grid.
+        region: Chip footprint, in ``crs``, with no filter margin.
+        crs: Output coordinate reference system.
+        crs_transform: Chip transform used for the download.
+        band: Band whose mask is counted. Sources whose bands all share one
+            mask can keep the default.
+        max_pixels: Pixel budget passed to ``reduceRegion``.
+
+    Returns:
+        Dictionary with ``nodata``, the number of masked pixels, and
+        ``counted``, the number of pixels the reduction visited. ``counted``
+        equals the chip's pixel count whenever the grids line up, so it is
+        worth recording as a check on the projection.
+    """
+    missing = image.select([band]).mask().Not().rename("nodata")
+    # ``missing`` is unmasked everywhere, so its own mask is a constant 1 band
+    # on the same grid: summing it reports how many pixels were visited.
+    counted = missing.mask().rename("counted")
+    return missing.addBands(counted).reduceRegion(
+        reducer=ee.Reducer.sum().unweighted(),
+        geometry=region,
+        crs=crs,
+        crsTransform=list(crs_transform),
+        maxPixels=max_pixels,
     )
 
 
@@ -361,8 +412,20 @@ class ImageSource:
             time_windows=time_windows,
             region=region,
         )
-        images = [
-            self.preprocess(
+        # Metadata is measured on the chip footprint alone. ``region`` above is
+        # widened by ``filter_margin``, which would count pixels the chip does
+        # not contain.
+        chip_footprint = chip_region(
+            crs=crs,
+            chip_transform=chip_transform,
+            width=width,
+            height=height,
+        )
+
+        images = []
+        metadata: dict[str, Any] = {}
+        for window_name, window_collection in window_collections:
+            window_image = self.preprocess(
                 collection=window_collection,
                 window_name=window_name,
                 time_bin=time_bin,
@@ -370,8 +433,20 @@ class ImageSource:
                 crs=crs,
                 crs_transform=chip_transform,
             )
-            for window_name, window_collection in window_collections
-        ]
+            images.append(window_image)
+            metadata.update(
+                self.chip_metadata(
+                    image=window_image,
+                    collection=window_collection,
+                    window_name=window_name,
+                    time_bin=time_bin,
+                    region=chip_footprint,
+                    crs=crs,
+                    crs_transform=chip_transform,
+                    width=width,
+                    height=height,
+                )
+            )
         if not images:
             raise ValueError(f"No image outputs generated for request {request_id}")
 
@@ -385,6 +460,7 @@ class ImageSource:
             time_bin=time_bin,
             point_id=point_id,
             source_name=source_name,
+            metadata=metadata,
         )
 
     def apply_global_filter(
@@ -430,6 +506,53 @@ class ImageSource:
             crs=crs,
             crsTransform=crs_transform,
         )
+
+    def chip_metadata(
+        self,
+        image: ee.Image,
+        collection: ee.ImageCollection,
+        window_name: str | None,
+        time_bin: str,
+        region: ee.Geometry,
+        crs: str,
+        crs_transform: list[float],
+        width: int,
+        height: int,
+    ) -> dict[str, Any]:
+        """Describe one time window of a chip in a sidecar JSON file.
+
+        Earth Engine drops image properties when it writes a GeoTIFF, so
+        metadata cannot ride along inside the chip. Whatever sources return
+        here is instead resolved on the client and written next to the chip as
+        ``{point_id}_{time_bin}_{source_name}.json``. Sources that return
+        nothing, which is the default, get no sidecar at all.
+
+        Values may be plain Python objects or unresolved Earth Engine objects:
+        the whole mapping for a chip is resolved in a single round trip, so
+        the number of time windows does not change the number of calls.
+
+        Keys are merged across windows into one document, so a source with
+        several windows must key its entries by window. ``chip`` is reserved
+        for the identifying block the downloader writes.
+
+        Args:
+            image: Window output from ``preprocess``, on the chip grid.
+            collection: Collection this window was composited from, before
+                ``preprocess`` touched it.
+            window_name: Name of the time window, or ``None`` for sources that
+                produce a single output.
+            time_bin: Output bin this chip belongs to.
+            region: Chip footprint, with no filter margin applied.
+            crs: Output coordinate reference system.
+            crs_transform: Chip transform used for the download.
+            width: Chip width in pixels.
+            height: Chip height in pixels.
+
+        Returns:
+            Mapping of sidecar keys to values, empty when a source has no
+            metadata to record.
+        """
+        return {}
 
     def filter_time_windows(
         self,
@@ -568,28 +691,76 @@ class ImageSource:
         time_bin: str,
         point_id: str,
         source_name: str,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         file_dir = out_dir / time_bin / source_name
         file_dir.mkdir(parents=True, exist_ok=True)
 
         filename_time_bin = time_bin.replace("/", "_")
         filename = file_dir / f"{point_id}_{filename_time_bin}_{source_name}.tif"
-        if filename.exists():
+        if not filename.exists():
+            # The output grid is requested explicitly. Passing a region instead
+            # would let Earth Engine derive its own transform from the region
+            # bounds, which resamples the image onto an unaligned grid and
+            # leaves seam artifacts.
+            url = image.getDownloadURL(
+                {
+                    "crs": crs,
+                    "crs_transform": list(chip_transform),
+                    "dimensions": dimensions,
+                    "format": "GEO_TIFF",
+                }
+            )
+            response = http_requests.get(url, stream=True)
+            if response.status_code != 200:
+                response.raise_for_status()
+            with open(filename, "wb") as out_file:
+                shutil.copyfileobj(response.raw, out_file)
+
+        if metadata:
+            self._write_metadata(
+                metadata=metadata,
+                image_path=filename,
+                crs=crs,
+                chip_transform=chip_transform,
+                dimensions=dimensions,
+                time_bin=time_bin,
+                point_id=point_id,
+                source_name=source_name,
+            )
+
+    def _write_metadata(
+        self,
+        metadata: dict[str, Any],
+        image_path: Path,
+        crs: str,
+        chip_transform: list[float],
+        dimensions: str,
+        time_bin: str,
+        point_id: str,
+        source_name: str,
+    ) -> None:
+        """Resolve chip metadata and write it beside the downloaded chip.
+
+        The whole mapping is resolved in one Earth Engine call, whatever the
+        number of time windows. An existing sidecar is left alone, so a rerun
+        costs nothing for chips that already have one.
+        """
+        metadata_path = image_path.with_suffix(".json")
+        if metadata_path.exists():
             return
 
-        # The output grid is requested explicitly. Passing a region instead would
-        # let Earth Engine derive its own transform from the region bounds, which
-        # resamples the image onto an unaligned grid and leaves seam artifacts.
-        url = image.getDownloadURL(
-            {
+        width, height = parse_dimensions(dimensions)
+        document = {
+            "chip": {
+                "point_id": point_id,
+                "time_bin": time_bin,
+                "source": source_name,
                 "crs": crs,
                 "crs_transform": list(chip_transform),
-                "dimensions": dimensions,
-                "format": "GEO_TIFF",
-            }
-        )
-        response = http_requests.get(url, stream=True)
-        if response.status_code != 200:
-            response.raise_for_status()
-        with open(filename, "wb") as out_file:
-            shutil.copyfileobj(response.raw, out_file)
+                "dimensions": [width, height],
+            },
+            **ee.Dictionary(metadata).getInfo(),
+        }
+        with open(metadata_path, "w") as out_file:
+            json.dump(document, out_file, indent=2, sort_keys=True)
