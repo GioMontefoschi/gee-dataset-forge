@@ -713,7 +713,14 @@ class ImageSource:
             )
             response = http_requests.get(url, stream=True)
             if response.status_code != 200:
-                response.raise_for_status()
+                # Earth Engine reports computation failures in the body of the
+                # pixel request, not in the status line, so it is raised along
+                # with the error instead of being dropped.
+                raise http_requests.HTTPError(
+                    f"{response.status_code} downloading {filename.name}: "
+                    f"{response.text.strip()}",
+                    response=response,
+                )
             with open(filename, "wb") as out_file:
                 shutil.copyfileobj(response.raw, out_file)
 
