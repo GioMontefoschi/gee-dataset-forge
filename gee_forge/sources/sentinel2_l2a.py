@@ -19,18 +19,27 @@ S2L2A_BANDS = [
         "B12",
         ]
 
-def mask_s2_clouds(image: ee.Image):
-    """Mask invalid and cloudy Sentinel-2 pixels using the SCL band.
+# SCL classes treated as invalid: no data, saturated/defective, dark area,
+# cloud shadow, cloud medium probability, cloud high probability, cirrus.
+SCL_INVALID_CLASSES = [0, 1, 2, 3, 8, 9, 10]
 
-    Args:
-        image: Sentinel-2 L2A image containing the ``SCL`` scene
-            classification band.
+def mask_s2_clouds(image: ee.Image) -> ee.Image:
+    """Mask invalid Sentinel-2 pixels using the SCL band.
 
-    Returns:
-        Input image with cloud, shadow, snow, and invalid SCL classes masked.
+    SCL is categorical, so it must keep nearest-neighbour resampling. Call this
+    before setting bilinear resampling on the reflectance bands.
     """
-    cloud_mask = image.select('SCL').eq(0).Or(image.select('SCL').eq(1)).Or(image.select('SCL').eq(2)).Or(image.select('SCL').eq(3)).Or(image.select('SCL').eq(8)).Or(image.select('SCL').eq(9)).Or(image.select('SCL').eq(10))
-    return image.updateMask(cloud_mask.Not())
+    scl = image.select("SCL")
+    invalid = scl.remap(
+        SCL_INVALID_CLASSES,
+        [1] * len(SCL_INVALID_CLASSES),
+        defaultValue=0,
+    )
+    return image.updateMask(invalid.Not())
+
+def prepare_s2(image: ee.Image) -> ee.Image:
+    """Mask with SCL, then interpolate only the reflectance bands."""
+    return mask_s2_clouds(image).select(S2L2A_BANDS).resample("bilinear")
 
 
 class S2L2ASource(ImageSource):
@@ -67,9 +76,7 @@ class S2L2ASource(ImageSource):
         crs_transform: list[float],
     ) -> ee.Image:
         image = (
-            collection.map(ee.Image.resample)
-            .map(mask_s2_clouds)
-            .select(S2L2A_BANDS)
+            collection.map(prepare_s2)
             .median()
             .reproject(crs=crs, crsTransform=crs_transform)
         )
