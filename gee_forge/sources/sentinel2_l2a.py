@@ -44,26 +44,36 @@ def prepare_s2(image: ee.Image) -> ee.Image:
     return mask_s2_clouds(image).select(S2L2A_BANDS).resample("bilinear")
 
 
-def blank_s2(collection_id: str) -> ee.Image:
-    """Build a fully masked scene that keeps empty windows well formed.
+def blank_s2() -> ee.Image:
+    """Build a fully masked image that keeps empty windows well formed.
 
     A window can end up with no scenes at all, and the median of an empty
     collection is an image with no bands: renaming it fails, and so does
     exporting it next to the windows that do have data. Merging this image
     into every window keeps the band names and the band types of a real
-    scene. Every pixel of it is masked, so it never reaches the median of a
-    window that has scenes of its own, and a window that has none composites
-    to a chip that is masked everywhere.
+    composite. Every pixel of it is masked, so it never reaches the median of
+    a window that has scenes of its own, and a window that has none
+    composites to a chip that is masked everywhere.
 
-    Args:
-        collection_id: Collection the window scenes come from, used so the
-            blank scene carries exactly their band types.
+    It is built from constants rather than from a scene of the collection.
+    A real scene would have to be reprojected onto the chip grid, often from
+    a distant UTM zone, which costs enough memory to fail whole chips when
+    many are downloaded at once.
+
+    The cast to ``uint16`` is what makes the merged collection homogeneous:
+    Earth Engine refuses to reduce a collection whose images disagree on band
+    type, and Sentinel-2 reflectance bands are ``uint16``.
 
     Returns:
-        Prepared scene with every pixel masked.
+        Fully masked image carrying the reflectance band names, typed like a
+        Sentinel-2 scene.
     """
-    scene = ee.Image(ee.ImageCollection(collection_id).first())
-    return prepare_s2(scene).updateMask(ee.Image.constant(0))
+    return (
+        ee.Image.constant([0] * len(S2L2A_BANDS))
+        .rename(S2L2A_BANDS)
+        .updateMask(ee.Image.constant(0))
+        .toUint16()
+    )
 
 
 class S2L2ASource(ImageSource):
@@ -99,9 +109,7 @@ class S2L2ASource(ImageSource):
         crs: str,
         crs_transform: list[float],
     ) -> ee.Image:
-        prepared = collection.map(prepare_s2).merge(
-            ee.ImageCollection([blank_s2(self.ee_collection_id)])
-        )
+        prepared = collection.map(prepare_s2).merge(ee.ImageCollection([blank_s2()]))
         image = prepared.median().reproject(crs=crs, crsTransform=crs_transform)
 
         if window_name is None:
